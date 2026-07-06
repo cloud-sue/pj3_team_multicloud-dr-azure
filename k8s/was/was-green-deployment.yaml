@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: was-green
+  namespace: app-was
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: was
+      version: green
+  template:
+    metadata:
+      labels:
+        app: was
+        version: green
+    spec:
+      nodeSelector:
+        kubernetes.azure.com/agentpool: appnp
+      containers:
+        - name: was-container
+          image: azsiskbeautyacr.azurecr.io/final-pj-was:green-04ef80e
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          startupProbe:
+            httpGet:
+              path: /api/healthz
+              port: 8080
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /api/healthz
+              port: 8080
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          env:
+            - name: CLOUD_PROVIDER
+              value: Azure
+            - name: SPRING_DATASOURCE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-secret
+                  key: db-url
+            - name: SPRING_DATASOURCE_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: db-secret
+                  key: db-user
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-secret
+                  key: db-password
+            # was-green은 Redis에 HttpSession을 저장해서 pod가 바뀌어도 로그인 세션을 유지한다.
+            - name: SPRING_SESSION_STORE_TYPE
+              value: redis
+            - name: SPRING_SESSION_REDIS_NAMESPACE
+              value: kbeauty:session
+            - name: SERVER_SERVLET_SESSION_TIMEOUT
+              value: 30m
+            # Redis 접속 정보는 git에 올리지 않는 redis-secret.yaml에서 주입한다.
+            - name: SPRING_DATA_REDIS_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: redis-secret
+                  key: redis-host
+            - name: SPRING_DATA_REDIS_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: redis-secret
+                  key: redis-ssl-port
+            - name: SPRING_DATA_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-secret
+                  key: redis-password
+            # Azure Managed Redis는 TLS 포트로 접속한다.
+            - name: SPRING_DATA_REDIS_SSL_ENABLED
+              value: "true"
+          resources:
+            requests:
+              cpu: "300m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"

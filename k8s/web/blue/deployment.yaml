@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-blue # Blue/Green 배포에서 현재 blue 버전의 WEB Deployment입니다.
+  namespace: app-web
+  labels:
+    # Service, HPA, 조회 명령에서 리소스를 묶기 위한 공통 라벨입니다.
+    app: web
+    color: blue
+    app.kubernetes.io/name: web
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/part-of: kbeauty
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3 # 이전 ReplicaSet을 3개까지 보관해 롤백 여지를 남깁니다.
+  selector:
+    matchLabels: # Deployment가 관리할 Pod를 찾는 기준입니다. template.metadata.labels와 반드시 일치해야 합니다.
+      app: web
+      color: blue
+  template:
+    metadata:
+      labels:
+        app: web # 아래 라벨은 Service selector와 Deployment selector가 Pod를 찾을 때 사용합니다.
+        color: blue
+        app.kubernetes.io/name: web
+        app.kubernetes.io/component: frontend
+        app.kubernetes.io/part-of: kbeauty
+    spec:
+      nodeSelector:
+        kubernetes.azure.com/agentpool: appnp # WEB Pod를 app 전용 노드풀에만 스케줄링합니다.
+      containers:
+        - name: web
+          image: azsiskbeautyacr.azurecr.io/final-pj-web:blue-508d79a
+          imagePullPolicy: Always
+          ports:
+            - name: http # nginx가 정적 WEB 파일을 서비스하는 컨테이너 포트입니다.
+              containerPort: 80
+          resources:
+            requests: # HPA CPU 사용률 계산은 request 값을 기준으로 합니다.
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe: #트래픽 받을 준비됐는지 체크
+            httpGet:
+              path: /healthz   
+              port: http
+            initialDelaySeconds: 5 # 컨테이너 시작 후 5초 뒤부터 체크 시작
+            periodSeconds: 10 # 10초마다 체크
+          livenessProbe: # 컨테이너가 살아있는지 체크
+            httpGet:
+              path: /healthz   
+              port: http 
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3  # ← 추가 (3번 연속 실패해야 재시작, 기본값이지만 명시 권장)

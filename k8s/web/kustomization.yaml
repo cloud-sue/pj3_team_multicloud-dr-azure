@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  # - namespace.yaml
+  - blue/deployment.yaml
+  - blue/service.yaml
+  - blue/hpa.yaml
+  - green/deployment.yaml
+  - green/service.yaml
+  - green/hpa.yaml
+  - service-active.yaml
+  - ingress.yaml
+
+# kustomization.yaml = 이 폴더 안의 K8s 리소스 목록/묶음 파일
+# 여러 Kubernetes YAML 파일을 한 번에 묶어서 적용하기 위한 파일
+# k apply -k final_pj/k8s/web
+# 여기서 -k가 kustomization.yaml을 보고 적용하라는 뜻

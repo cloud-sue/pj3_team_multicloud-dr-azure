@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ingress-system
+  labels:
+    name: ingress-system
+    environment: dev
+    app.kubernetes.io/part-of: platform # kbeauty 앱 관련 리소스임을 나타내는 라벨
+    app.kubernetes.io/component: ingress-controller # ingress controller 관련 리소스임을 나타내는 라벨
+  annotations:
+    description: Ingress Controller related resources
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: argocd
+  labels:
+    name: argocd
+    environment: dev
+    app.kubernetes.io/part-of: platform
+    app.kubernetes.io/component: gitops
+  annotations:
+    description: ArgoCD
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    name: monitoring
+    environment: dev
+    app.kubernetes.io/part-of: platform
+    app.kubernetes.io/component: observability
+  annotations:
+    description: monitoring resources
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app-web
+  labels:
+    name: app-web
+    environment: dev
+    app.kubernetes.io/part-of: kbeauty
+    app.kubernetes.io/component: web
+  annotations:
+    description: Development WEB
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app-was
+  labels:
+    name: app-was
+    environment: dev
+    app.kubernetes.io/part-of: kbeauty 
+    app.kubernetes.io/component: was
+  annotations:
+    description: Development WAS
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: external-secrets
+  labels:
+    name: external-secrets
+    environment: dev
+    app.kubernetes.io/part-of: platform
+    app.kubernetes.io/component: secrets
+  annotations:
+    description: Key Vault integrated Secret management

@@ -1,0 +1,18 @@
+# 현재 운영 트래픽을 받을 Service입니다. Deployment의 Pod 중에서 label이 app=web, color=blue인 Pod로 트래픽을 라우팅합니다.
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-active
+  namespace: app-web
+  labels:
+    app: web
+    role: active
+spec:
+  type: ClusterIP
+  selector: # 현재 운영 트래픽을 받을 색상
+    app: web
+    color: blue
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

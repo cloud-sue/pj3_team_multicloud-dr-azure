@@ -1,0 +1,31 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: was-blue-hpa
+  namespace: app-was
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: was-blue
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+  behavior:
+    scaleUp:
+      #2분간 CPU 높게 유지돼야 스케일 아웃 (JVM 워밍업 스파이크 무시)
+      stabilizationWindowSeconds: 120
+      policies:
+        - type: Pods
+          value: 1
+          # 60초마다 최대 1개씩 추가
+          periodSeconds: 60
+    scaleDown:
+      #5분간 CPU 낮게 유지돼야 스케일in (잠깐 내려갔다고 바로 안줄이도록)
+      stabilizationWindowSeconds: 300   

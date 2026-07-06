@@ -1,0 +1,35 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web # AGIC가 읽어서 Azure Application Gateway 라우팅 규칙으로 변환할 Ingress입니다.
+            # AGIC가 Application Gateway를 읽고 수정할 권한 필요 -> infra/modules/azure/agw/main.tf에서 lifecycle ignore_changes 설정
+  namespace: app-web
+  annotations:
+    kubernetes.io/ingress.class: azure/application-gateway # 이 Ingress를 AGIC가 처리하게 지정합니다.
+    appgw.ingress.kubernetes.io/appgw-ssl-certificate: www-sue019522-shop # Terraform에서 AppGW에 등록한 SSL 인증서 이름입니다.
+    appgw.ingress.kubernetes.io/backend-path-prefix: / # 백엔드 Pod로 전달할 때 path prefix를 / 로 맞춥니다.
+    appgw.ingress.kubernetes.io/health-probe-path: /healthz # AppGW가 WEB Pod 상태를 확인할 경로입니다.
+    appgw.ingress.kubernetes.io/request-timeout: "30" # Application Gateway가 백엔드 응답을 기다리는 시간입니다.
+    appgw.ingress.kubernetes.io/ssl-redirect: "true" # HTTP 80 요청을 HTTPS 443으로 리다이렉트합니다.
+spec:
+  rules:
+    - host: www.sue019522.shop # 이 도메인으로 들어온 요청만 WEB Ingress가 처리합니다.
+      http:
+        paths:
+          # 경로기반 카나리
+          # nginx.ingress.kubernetes.io/canary-weight: "10" 는 다른 ingress에서 사용할 수 있는 annotation이지만,
+          # AGIC는 path 기반 라우팅만 지원하므로 /canary 경로로 직접 라우팅합니다.
+          - path: /canary # Canary 테스트용 경로입니다. green Service로 직접 보냅니다.
+            pathType: Prefix
+            backend:
+              service:
+                name: web-green
+                port:
+                  number: 80
+          - path: / # 일반 사용자 트래픽입니다. web-active Service가 현재 active color를 선택합니다.
+            pathType: Prefix
+            backend:
+              service:
+                name: web-active
+                port:
+                  number: 80

@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: was-green-service
+  namespace: app-was
+spec:
+  type: ClusterIP
+  selector:
+    app: was
+    version: green
+  ports:
+    - port: 80
+      targetPort: 8080
