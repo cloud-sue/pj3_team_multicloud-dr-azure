@@ -1,0 +1,27 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: final-pj-whatap
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/refresh: hard
+spec:
+  project: default
+
+  source:
+    repoURL: git@github.com:bespin-multi-cloud-3-azure/final_pj.git
+    targetRevision: main
+    path: whatap
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: whatap-monitoring
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - SkipDryRunOnMissingResource=true
