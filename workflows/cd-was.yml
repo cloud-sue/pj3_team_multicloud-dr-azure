@@ -1,0 +1,333 @@
+name: CD WAS
+
+# WAS 변경 시 inactive color만 새 이미지로 배포하고, 승인 후 active service를 전환한다.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "app/was_blue/**"
+      - "app/was_green/**"
+      - "k8s/was/**"
+      - "whatap/**"
+      - ".github/workflows/cd-was.yml"
+      # - ".github/workflows/citest.sh"
+  workflow_dispatch:
+    inputs:
+      target_color:
+        # commit message에 "deploy"가 포함된 경우에만
+        description: "배포할 color입니다. auto는 현재 active의 반대 색상을 선택합니다."
+        required: true
+        default: auto
+        type: choice
+        options:
+          - auto
+          - blue
+          - green
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: cd-was-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  determine-target:
+    name: Determine WAS target colors
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || (github.actor != 'github-actions[bot]' && contains(github.event.head_commit.message || '', 'deploy') && !contains(github.event.head_commit.message || '', '[skip cd]'))
+    outputs:
+      target_colors: ${{ steps.target.outputs.target_colors }}
+      promote_color: ${{ steps.target.outputs.promote_color }}
+      image_tag: ${{ steps.target.outputs.image_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      # 현재 운영 트래픽은 was-service.yaml의 selector.version이 가리키는 Deployment로 간다.
+      # push 이벤트에서는 변경된 WAS 폴더를 우선 보고 blue/green 배포 대상을 정한다.
+      # 둘 다 바뀌었거나 공통 파일만 바뀌면 blue/green 둘 다 빌드하고 manifest를 갱신한다.
+      - name: Set target colors
+        id: target
+        env:
+          REQUESTED_COLOR: ${{ inputs.target_color || 'auto' }}
+          BEFORE_SHA: ${{ github.event.before || '' }}
+        run: |
+          ACTIVE_COLOR="$(awk '/version:/ { print $2; exit }' k8s/was/was-service.yaml)"
+
+          if [ "${{ github.event_name }}" = "push" ]; then
+            if [ -n "$BEFORE_SHA" ] && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+              CHANGED_FILES="$(git diff --name-only "$BEFORE_SHA" "$GITHUB_SHA")"
+            else
+              CHANGED_FILES="$(git diff --name-only HEAD~1 HEAD)"
+            fi
+
+            BLUE_CHANGED=false
+            GREEN_CHANGED=false
+
+            if printf '%s\n' "$CHANGED_FILES" | grep -Eq '^(app/was_blue/|k8s/was/image_build/blue/|k8s/was/was-blue-)'; then
+              BLUE_CHANGED=true
+            fi
+
+            if printf '%s\n' "$CHANGED_FILES" | grep -Eq '^(app/was_green/|k8s/was/image_build/green/|k8s/was/was-green-)'; then
+              GREEN_CHANGED=true
+            fi
+
+            if [ "$BLUE_CHANGED" = "true" ] && [ "$GREEN_CHANGED" = "false" ]; then
+              TARGET_COLORS='["blue"]'
+              PROMOTE_COLOR="blue"
+            elif [ "$GREEN_CHANGED" = "true" ] && [ "$BLUE_CHANGED" = "false" ]; then
+              TARGET_COLORS='["green"]'
+              PROMOTE_COLOR="green"
+            else
+              TARGET_COLORS='["blue","green"]'
+              PROMOTE_COLOR=""
+            fi
+          else
+            if [ "$REQUESTED_COLOR" = "auto" ]; then
+              if [ "$ACTIVE_COLOR" = "blue" ]; then
+                PROMOTE_COLOR="green"
+              else
+                PROMOTE_COLOR="blue"
+              fi
+            else
+              PROMOTE_COLOR="$REQUESTED_COLOR"
+            fi
+            TARGET_COLORS="[\"${PROMOTE_COLOR}\"]"
+          fi
+
+          IMAGE_TAG="${GITHUB_SHA::7}"
+
+          echo "target_colors=$TARGET_COLORS" >> "$GITHUB_OUTPUT"
+          echo "promote_color=$PROMOTE_COLOR" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "Active color: $ACTIVE_COLOR"
+          echo "Target colors: $TARGET_COLORS"
+          echo "Promote color: ${PROMOTE_COLOR:-none}"
+
+  build-scan-push:
+    name: Build, scan, push WAS (${{ matrix.color }})
+    runs-on: ubuntu-latest
+    needs: determine-target
+    strategy:
+      fail-fast: false
+      matrix:
+        color: ${{ fromJSON(needs.determine-target.outputs.target_colors) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login to ACR
+        env:
+          ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+        run: |
+          ACR_NAME="${ACR_LOGIN_SERVER%%.azurecr.io}"
+          az acr login --name "$ACR_NAME"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-northeast-2
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # target color 목록에 포함된 WAS 이미지를 각각 빌드한다.
+      - name: Build Docker image
+        env:
+          ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+          TARGET_COLOR: ${{ matrix.color }}
+          IMAGE_TAG: ${{ needs.determine-target.outputs.image_tag }}
+        run: |
+          COLOR_IMAGE_TAG="${TARGET_COLOR}-${IMAGE_TAG}"
+          docker build \
+            -f "k8s/was/image_build/${TARGET_COLOR}/Dockerfile" \
+            -t "final-pj-was:$COLOR_IMAGE_TAG" \
+            -t "$ACR_LOGIN_SERVER/final-pj-was:$COLOR_IMAGE_TAG" \
+            "."
+
+      # 현재는 취약점 로그를 남기되 배포를 막지 않는다. 운영 기준 확정 후 exit-code를 1로 바꿀 수 있다.
+      - name: Security scan
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ secrets.ACR_LOGIN_SERVER }}/final-pj-was:${{ matrix.color }}-${{ needs.determine-target.outputs.image_tag }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+
+      # Argo CD는 registry를 직접 감지하지 않으므로, push 이후 GitOps manifest tag 업데이트가 필요하다.
+      - name: Push to ACR
+        env:
+          ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+          TARGET_COLOR: ${{ matrix.color }}
+          IMAGE_TAG: ${{ needs.determine-target.outputs.image_tag }}
+        run: docker push "$ACR_LOGIN_SERVER/final-pj-was:${TARGET_COLOR}-${IMAGE_TAG}"
+
+      # AWS DR EKS에서 사용할 수 있도록 같은 이미지를 ECR에도 업로드한다.
+      # color별 repository는 final_pj_aws/infra/dr의 기본 ECR 이름(was-blue/was-green)과 맞춘다.
+      - name: Push to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          ECR_NAMESPACE: azsis-kbeauty-dr
+          TARGET_COLOR: ${{ matrix.color }}
+          IMAGE_TAG: ${{ needs.determine-target.outputs.image_tag }}
+        run: |
+          SOURCE_IMAGE="final-pj-was:${TARGET_COLOR}-${IMAGE_TAG}"
+          ECR_IMAGE="$ECR_REGISTRY/$ECR_NAMESPACE/was-${TARGET_COLOR}"
+
+          docker tag "$SOURCE_IMAGE" "$ECR_IMAGE:${TARGET_COLOR}-${IMAGE_TAG}"
+          docker tag "$SOURCE_IMAGE" "$ECR_IMAGE:latest"
+
+          docker push "$ECR_IMAGE:${TARGET_COLOR}-${IMAGE_TAG}"
+          docker push "$ECR_IMAGE:latest"
+
+  update-gitops:
+    name: Update inactive WAS image tag
+    runs-on: ubuntu-latest
+    needs:
+      - determine-target
+      - build-scan-push
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout AWS GitOps repository
+        uses: actions/checkout@v4
+        with:
+          repository: bespin-multi-cloud-3-azure/final_pj_aws
+          ref: main
+          path: aws-gitops
+          token: ${{ secrets.AWS_GITOPS_TOKEN }}
+          fetch-depth: 0
+
+      # Argo CD가 감시하는 inactive WAS Deployment image tag만 갱신한다.
+      # 이 commit이 들어가면 Argo CD가 inactive color Pod를 새 이미지로 sync한다.
+      - name: Update WAS deployment manifest
+        env:
+          ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+          ECR_REGISTRY: ${{ secrets.AWS_ECR_REGISTRY || '946775837287.dkr.ecr.ap-northeast-2.amazonaws.com' }}
+          ECR_NAMESPACE: azsis-kbeauty-dr
+          TARGET_COLORS: ${{ needs.determine-target.outputs.target_colors }}
+          IMAGE_TAG: ${{ needs.determine-target.outputs.image_tag }}
+        run: |
+          for TARGET_COLOR in $(echo "$TARGET_COLORS" | jq -r '.[]'); do
+            sed -i "s|^\([[:space:]]*image:\).*|\1 ${ACR_LOGIN_SERVER}/final-pj-was:${TARGET_COLOR}-${IMAGE_TAG}|" "k8s/was/was-${TARGET_COLOR}-deployment.yaml"
+            sed -i "s|^\([[:space:]]*image:\).*|\1 ${ECR_REGISTRY}/${ECR_NAMESPACE}/was-${TARGET_COLOR}:${TARGET_COLOR}-${IMAGE_TAG}|" "aws-gitops/k8s/was/${TARGET_COLOR}/deployment.yaml"
+          done
+
+      # 이미지 태그 변경 commit은 [skip cd]를 붙여 CD 재실행 루프를 막는다.
+      - name: Commit GitOps update
+        env:
+          IMAGE_TAG: ${{ needs.determine-target.outputs.image_tag }}
+          TARGET_COLORS: ${{ needs.determine-target.outputs.target_colors }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          CHANGED_DEPLOYMENTS="$(echo "$TARGET_COLORS" | jq -r '.[] | "k8s/was/was-" + . + "-deployment.yaml"')"
+          AWS_CHANGED_DEPLOYMENTS="$(echo "$TARGET_COLORS" | jq -r '.[] | "k8s/was/" + . + "/deployment.yaml"')"
+
+          if git diff --quiet -- $CHANGED_DEPLOYMENTS; then
+            echo "No WAS image tag changes."
+          else
+            git add $CHANGED_DEPLOYMENTS
+            git commit -m "chore(cd): deploy WAS images ${IMAGE_TAG} [skip cd]"
+            git pull --rebase origin main
+            git push
+          fi
+
+          (
+            cd aws-gitops
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            if git diff --quiet -- $AWS_CHANGED_DEPLOYMENTS; then
+              echo "No AWS WAS image tag changes."
+              exit 0
+            fi
+
+            git add $AWS_CHANGED_DEPLOYMENTS
+            git commit -m "chore(cd): deploy AWS WAS images ${IMAGE_TAG} [skip cd]"
+            git pull --rebase origin main
+            git push
+          )
+
+  smoke-test:
+    name: WAS smoke test
+    runs-on: ubuntu-latest
+    needs:
+      - determine-target
+      - update-gitops
+    env:
+      WAS_STAGING_HEALTH_URL: ${{ secrets.WAS_STAGING_HEALTH_URL }}
+
+    steps:
+      # inactive color endpoint를 별도로 노출했다면 이 URL로 검증한다.
+      # URL이 없으면 smoke test는 skip되고, 다음 promotion approval 단계로 넘어간다.
+      - name: Check WAS staging health endpoint
+        if: env.WAS_STAGING_HEALTH_URL != ''
+        run: curl -fsS --retry 20 --retry-delay 15 "$WAS_STAGING_HEALTH_URL"
+
+      - name: Skip smoke test when URL is not configured
+        if: env.WAS_STAGING_HEALTH_URL == ''
+        run: echo "WAS_STAGING_HEALTH_URL secret is not configured. Smoke test skipped."
+
+  # promote-active:
+  #   name: Promote WAS active color
+  #   runs-on: ubuntu-latest
+  #   needs:
+  #     - determine-target
+  #     - smoke-test
+  #   if: needs.determine-target.outputs.promote_color != ''
+  #   # GitHub Environment production에 required reviewer를 설정하면 트래픽 전환 전에 수동 승인을 받는다.
+  #   environment: production
+
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v4
+  #       with:
+  #         fetch-depth: 0
+
+  #     # active service selector를 target color로 전환한다.
+  #     # 이 commit이 들어가면 Argo CD가 service selector를 sync하고 운영 트래픽이 target color로 이동한다.
+  #     - name: Switch active WAS service
+  #       env:
+  #         TARGET_COLOR: ${{ needs.determine-target.outputs.promote_color }}
+  #       run: sed -i "s|^\([[:space:]]*version:\).*|\1 ${TARGET_COLOR}|" k8s/was/was-service.yaml
+
+  #     - name: Commit traffic switch
+  #       env:
+  #         TARGET_COLOR: ${{ needs.determine-target.outputs.promote_color }}
+  #       run: |
+  #         git config user.name "github-actions[bot]"
+  #         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+  #         if git diff --quiet -- k8s/was/was-service.yaml; then
+  #           echo "WAS active service already points to ${TARGET_COLOR}."
+  #           exit 0
+  #         fi
+
+  #         git add k8s/was/was-service.yaml
+  #         git commit -m "chore(cd): promote WAS ${TARGET_COLOR} to active [skip cd]"
+  #         git pull --rebase origin main
+  #         git push

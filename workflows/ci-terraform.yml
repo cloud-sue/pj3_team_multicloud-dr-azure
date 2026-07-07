@@ -1,0 +1,224 @@
+name: CI Terraform
+
+# Terraform 코드가 바뀐 PR에서만 실행한다.
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+    paths:
+      - "infra/**"
+      - ".github/workflows/ci-terraform.yml"
+      # - ".github/workflows/citest.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  issues: write
+  pull-requests: write
+
+env:
+  TF_VERSION: "1.14.7"
+  TF_WORKING_DIR: "infra"
+  # ACME DNS-01 인증서 발급에서 공개적으로 고정해도 되는 Terraform 변수입니다.
+  # GitHub Actions에서는 azure/login이 만든 Azure CLI 세션을 ACME DNS challenge가 재사용합니다.
+  TF_VAR_acme_azure_auth_method: "cli"
+  TF_VAR_acme_dns_zone_name: "sue019522.shop"
+  TF_VAR_appgw_ssl_hostname: "www.sue019522.shop"
+
+concurrency:
+  group: ci-terraform-${{ github.ref }}
+  cancel-in-progress: true
+
+  # commit message에 "deploy"가 포함된 경우에만 이후 빌드/테스트 단계가 실행
+jobs:
+  commit-message-gate:
+    name: Check deploy commit message
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        if: github.event_name == 'pull_request'
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+
+      - name: Check latest commit message
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          COMMIT_MESSAGE="$(git log -1 --pretty=%B)"
+          if printf '%s' "$COMMIT_MESSAGE" | grep -qi 'deploy'; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Terraform 코드 포맷, 초기화, validate, lint, 보안 스캔을 실행한다.
+  terraform-quality-gate:
+    name: Terraform quality gate
+    runs-on: ubuntu-latest
+    needs: commit-message-gate
+    if: needs.commit-message-gate.outputs.should_run == 'true'
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # infra/provider.tf의 required_version 조건을 만족하는 Terraform 버전을 설치한다.
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Format Check
+        run: terraform fmt -check -recursive
+
+      # 원격 backend 인증 없이 문법과 provider 구성을 검증하기 위해 backend=false로 초기화한다.
+      - name: Init without backend
+        run: terraform init -backend=false
+
+      - name: Validate
+        run: terraform validate
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+
+      # 하위 모듈 provider 검사 제거 위해 disable-rule 옵션을 적용한다.
+      - name: Run TFLint
+        run: |
+          tflint --init
+          tflint --recursive \
+            --disable-rule=terraform_required_version \
+            --disable-rule=terraform_required_providers
+
+      # tfsec-action은 GitHub release API 접근이 조직 IP allow list에 막힐 수 있어 Docker 이미지로 실행한다.
+      # 보안 기준이 확정되기 전까지는 결과를 경고로만 남긴다.
+      - name: Security Scan
+        continue-on-error: true
+        run: docker run --rm -v "$PWD:/src" aquasec/tfsec /src/${{ env.TF_WORKING_DIR }} --soft-fail
+
+  # PR에서 Terraform plan을 실행하고 결과를 댓글로 업데이트한다.
+  terraform-plan:
+    name: Terraform plan
+    runs-on: ubuntu-latest
+    needs:
+      - commit-message-gate
+      - terraform-quality-gate
+    if: github.event_name == 'pull_request' && needs.commit-message-gate.outputs.should_run == 'true'
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # setup-terraform wrapper를 켜두면 plan stdout/stderr를 PR 댓글에 사용할 수 있다.
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # Terraform plan이 AWS core remote state에서 CloudFront 도메인을 읽을 수 있도록 AWS 인증을 설정한다.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-northeast-2
+
+      # GitHub OIDC로 Azure에 로그인한다. 아래 secret 3개가 repository에 등록되어 있어야 한다.
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Plan
+        id: plan
+        env:
+          TF_VAR_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          # Terraform plan도 실제 apply와 같은 입력값으로 검증한다.
+          # 이 값은 MySQL admin 계정과 Key Vault Secret(kbeauty-db-user/password)에 사용된다.
+          TF_VAR_admin_username: ${{ secrets.DB_ADMIN_USERNAME }}
+          TF_VAR_admin_password: ${{ secrets.DB_ADMIN_PASSWORD }}
+        run: |
+          set +e
+          terraform plan -input=false -var-file="terraform.tfvars" -lock=false -no-color -detailed-exitcode > plan.stdout 2> plan.stderr
+          exit_code=$?
+          set -e
+
+          cat plan.stdout
+          cat plan.stderr >&2
+
+          echo "exit_code=${exit_code}" >> "$GITHUB_OUTPUT"
+
+      - name: Post Plan to PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const planDir = path.join(process.env.GITHUB_WORKSPACE, process.env.TF_WORKING_DIR);
+            const stdoutPath = path.join(planDir, 'plan.stdout');
+            const stderrPath = path.join(planDir, 'plan.stderr');
+            const stdout = fs.existsSync(stdoutPath) ? fs.readFileSync(stdoutPath, 'utf8') : '';
+            const stderr = fs.existsSync(stderrPath) ? fs.readFileSync(stderrPath, 'utf8') : '';
+            const exitCode = ${{ toJSON(steps.plan.outputs.exit_code) }};
+            const outcome = exitCode === '0' ? 'no changes' : exitCode === '2' ? 'changes present' : 'failed';
+            const output = `#### Terraform Plan (${outcome})
+            \`\`\`
+            ${stdout || 'No Terraform stdout captured.'}
+            ${stderr ? `\n--- stderr ---\n${stderr}` : ''}
+            \`\`\`
+            *Triggered by @${{ github.actor }}*`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const botComment = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('Terraform Plan')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: output
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: output
+              });
+            }
+
+      - name: Fail if Plan Failed
+        if: steps.plan.outputs.exit_code == '1'
+        run: exit 1
